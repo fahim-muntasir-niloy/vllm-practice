@@ -2,3 +2,7 @@
 __pycache__/
 *.py[cod]
 .env
+# The agent's workspace folder
+scratchpad/
+# Conversation memory
+.data/
