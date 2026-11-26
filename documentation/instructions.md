@@ -1,5 +1,7 @@
 # vLLM Setup and Operations Guide
 
+This guide covers Linux (Fedora). On Windows, see [windows.md](windows.md).
+
 ## Current working setup
 
 | Component | Value |

@@ -1,0 +1,1 @@
+wsl -d Ubuntu --cd /home/munta -- bash -lc 'source venvs/vllm-app/bin/activate && VLLM_USE_FLASHINFER_SAMPLER=0 vllm serve LiquidAI/LFM2.5-1.2B-Instruct --host 127.0.0.1 --gpu-memory-utilization 0.8 --max-model-len 32768 --enable-auto-tool-choice --tool-call-parser lfm2'
