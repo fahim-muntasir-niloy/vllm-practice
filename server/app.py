@@ -1,64 +1,97 @@
-"""FastAPI server: serves the React chat UI and a streaming chat endpoint backed by vLLM."""
+"""FastAPI server: serves the React chat UI and streams the deep agent's run to it."""
 
+import json
 import os
+import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
 
-from fastapi import FastAPI
+ROOT = Path(__file__).resolve().parent.parent
+# `uv run server/app.py` only puts server/ on the path; the agent lives in the project root.
+sys.path.insert(0, str(ROOT))
+
+# Imported first: it configures checkpoint loading before langgraph is imported.
+from agent.memory import open_checkpointer, rewind
+
+from fastapi import FastAPI, HTTPException
+from fastapi import Path as PathParam
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, Field
 
-# vLLM is bound to the Docker bridge address (see documentation/instructions.md).
-VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://172.17.0.1:8000/v1")
-VLLM_MODEL = os.environ.get("VLLM_MODEL", "LiquidAI/LFM2.5-1.2B-Instruct")
+from agent import history
+from agent.factory import CUSTOM_TOOLS, SYSTEM_PROMPT, build_agent
+from agent.llm import VLLM_MODEL
+from agent.streaming import agent_events
+from utils.logger import logger
 
-FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-
-app = FastAPI(title="vLLM chat")
-
-llm = ChatOpenAI(
-    base_url=VLLM_BASE_URL,
-    api_key="none",
-    model=VLLM_MODEL,
-    temperature=0.7,
-    streaming=True,
-)
+FRONTEND_DIST = ROOT / "frontend" / "dist"
+THREAD_ID = r"^[A-Za-z0-9_-]{1,64}$"
 
 
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with open_checkpointer() as checkpointer:
+        await history.setup(checkpointer)
+        app.state.checkpointer = checkpointer
+        app.state.agent = build_agent(checkpointer)
+        yield
+
+
+app = FastAPI(title="vLLM chat", lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage]
+    """One new user message. The server remembers the rest of the thread."""
 
-
-def to_langchain(messages: list[ChatMessage]) -> list[BaseMessage]:
-    converted: list[BaseMessage] = []
-    for m in messages:
-        if m.role == "system":
-            converted.append(SystemMessage(content=m.content))
-        elif m.role == "assistant":
-            converted.append(AIMessage(content=m.content))
-        else:
-            converted.append(HumanMessage(content=m.content))
-    return converted
+    thread_id: str = Field(pattern=THREAD_ID)
+    message_id: str = Field(min_length=1, max_length=64)
+    content: str = Field(min_length=1)
+    # Ids of the earlier user messages the chat still shows, oldest first.
+    history: list[str] = []
 
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
-    messages = to_langchain(req.messages)
+    """Stream the run as newline-delimited JSON, one event per line (see agent/streaming.py)."""
+    agent = app.state.agent
+    message = HumanMessage(content=req.content, id=req.message_id)
 
-    async def token_stream():
-        async for chunk in llm.astream(messages):
-            if chunk.content:
-                yield chunk.content
+    async def event_stream():
+        try:
+            await rewind(agent, {"configurable": {"thread_id": req.thread_id}}, req.history)
+            own_tools = frozenset(t.name for t in CUSTOM_TOOLS)
+            async for event in agent_events(
+                agent, [message], SYSTEM_PROMPT, own_tools, thread_id=req.thread_id
+            ):
+                if event["type"] == "context":
+                    await history.save_context(app.state.checkpointer, req.thread_id, event)
+                yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        except Exception as error:
+            # The response has already started, so report the failure as an event.
+            logger.exception("Agent run failed")
+            yield json.dumps({"type": "error", "message": f"{type(error).__name__}: {error}"}) + "\n"
 
-    return StreamingResponse(token_stream(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        # Stop proxies from holding back the stream.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/threads")
+async def threads() -> list[dict]:
+    return await history.list_threads(app.state.agent, app.state.checkpointer)
+
+
+@app.get("/api/threads/{thread_id}")
+async def thread(thread_id: str = PathParam(pattern=THREAD_ID)) -> dict:
+    saved = await history.load_thread(app.state.agent, app.state.checkpointer, thread_id)
+    if saved is None:
+        raise HTTPException(404, "Thread not found")
+    return saved
 
 
 @app.get("/api/health")
